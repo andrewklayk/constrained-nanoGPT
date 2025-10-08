@@ -85,5 +85,6 @@ with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            # breakpoint()
             print(decode(y[0].tolist()))
             print('---------------')

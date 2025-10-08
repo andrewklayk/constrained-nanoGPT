@@ -194,20 +194,28 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+    
 
-    def constraint(self, logits):
-        enc = tiktoken.get_encoding("gpt2")
-        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-        decode = lambda l: enc.decode(l)
+    def constraint(self, logits, token):
+        """
+        Compute a regularization loss term that penalizes high probability of a specific token.
+
+        Args:
+            logits: The model's logits (before softmax), shape (batch_size, seq_len, vocab_size)
+            token: The token ID to penalize
+
+        Returns:
+            A scalar loss term to be added to the total loss
+        """
+        # Compute softmax probabilities        
+        probs = F.softmax(logits, dim=-1)  # shape (batch_size, seq_len, vocab_size)
         
-        logits = logits[:, -1, :]
-        # apply softmax to convert logits to (normalized) probabilities
-        probs = F.softmax(logits, dim=-1)
-        # sample from the distribution
-        idx_next = torch.multinomial(probs, num_samples=1)
-        outs = decode(idx_next.tolist())
-        
-        
+        # Extract the probability of the unwanted token
+        token_probs = probs[..., token]  # shape (batch_size, seq_len)
+
+        # Penalize high probability: use mean to aggregate over batch and sequence
+        penalty = torch.mean(token_probs)
+        return penalty   
 
 
     def crop_block_size(self, block_size):
@@ -304,14 +312,15 @@ class GPT(nn.Module):
         
         optimizer = SSLALM_Adam(
             params=optim_groups,
-            m=1,
-            mu=0.,
-            lr=1e-4,
-            dual_lr=1e-3,
-            rho=1.,
-            dual_bound=10,
-            beta1 =betas[0],
-            beta2 =betas[1],
+            m = 1,
+            mu = 2.,
+            lr = 1e-3,
+            dual_lr = 5e-1,
+            rho = 2.,
+            dual_bound = 50,
+            beta1 = betas[0],
+            beta2 = betas[1],
+            device=device_type
             # **extra_args
         )
 

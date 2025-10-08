@@ -81,10 +81,6 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 
-# CONSTRAINTS
-constraint_fns = [
-    lambda x: torch.tensor(0., requires_grad=True)
-]
 
 if ddp:
     init_process_group(backend=backend)
@@ -208,6 +204,20 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
+
+# BANNED_TOKEN = 39 # a
+# BANNED_TOKEN = 40 # b
+BANNED_TOKEN = 58 # t?
+# BANNED_TOKEN = 6 # ,
+# BANNED_TOKEN = 53 # o
+
+# CONSTRAINTS
+constraint_fns = [
+    lambda logits: model.constraint(logits=logits, token=BANNED_TOKEN)
+    # lambda _: torch.tensor(0., requires_grad=True)
+]
+
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -231,6 +241,23 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+    model.train()
+    return out
+
+
+@torch.no_grad()
+def estimate_constraints(token):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        constraints = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                logits, _ = model(X, Y)
+                constraint = model.constraint(logits, token)
+            constraints[k] = constraint.item()
+        out[split] = constraints.mean()
     model.train()
     return out
 
@@ -259,6 +286,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -269,7 +297,9 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        constraints = estimate_constraints(token=BANNED_TOKEN)
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train constr {constraints['val']:.4f}, val constr {constraints['val']:.4f}")
+        print(f"optimizer dual vars: {optimizer._dual_vars}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -293,47 +323,46 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
+    # if iter_num == 30:
+    #     s = torch.cuda.memory._snapshot()
+    #     with open(f"snapshot.pickle", "wb") as f:
+    #         pickle.dump(s, f)
+    #     torch.cuda.memory._record_memory_history(enabled=None)
+    #     break
 
-    batch_c = torch.zeros(len(constraint_fns))
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+    with ctx:
+        logits, loss = model(X, Y)
 
-            # for cf in constraint_fns:
-            #     cv = cf(logits) / gradient_accumulation_steps
-            breakpoint()
-            micro_batch_c = [cf(logits) / gradient_accumulation_steps for cf in constraint_fns]
-            
+    # immediately async prefetch next batch while model is doing the forward pass on the GPU
+    X, Y = get_batch('train')
 
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+    # eval constraints
+    with ctx:
+        constr_eval = []
+        for cf in constraint_fns:
+            constr_eval.append(cf(logits))
 
-        # constraint backward pass
-        for j, cv in enumerate(micro_batch_c):
-            cv = scaler.scale(cv)
-            batch_c[j] += cv.detach()
-            cv.backward()
-            optimizer._save_grad_constr(j, sum_aggregate=True)
-            optimizer.zero_grad(set_to_none=True)
+    # torch.cuda.memory._record_memory_history(enabled='all')
+    # constraint backward pass
+    for j, cv in enumerate(constr_eval):
+        cv = scaler.scale(cv)
+        cv.backward(
+            retain_graph=True
+        )
         
-        # objective backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-        optimizer._save_grad_obj(sum_aggregate=True)
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    # step the optimizer and scaler if training in fp16
-    for j, cv in enumerate(batch_c):
-        optimizer.dual_step(j, batch_c)
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    scaler.step(optimizer)
+        # breakpoint()
+        optimizer.dual_step(j, cv)
+        optimizer.zero_grad(set_to_none=True)
+        
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)#, c_val=[cv.detach() for cv in constr_eval])
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
@@ -346,10 +375,13 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        constr_f = constr_eval[0].item()
+        constr_eval.clear()
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, constr {constr_f:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        del constr_f
     iter_num += 1
     local_iter_num += 1
 
