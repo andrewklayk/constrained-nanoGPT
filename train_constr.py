@@ -197,25 +197,26 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
+# constraints
+
+# BANNED_TOKEN = 39 # a
+# BANNED_TOKEN = 40 # b
+# BANNED_TOKEN = 58 # t
+# BANNED_TOKEN = 6 # ,
+# BANNED_TOKEN = 53 # o
+
+BANNED_TOKENS = [0, 39]
+
+# constraint_fns = [lambda logits: constraint(logits=logits, token=token) for token in BANNED_TOKENS]
+
 # optimizer
-# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)\
-optimizer = model.configure_constrained_optimizer(weight_decay, learning_rate, (beta1, beta2), device_type)
+dual_learning_rate = 5e-1
+optimizer = model.configure_constrained_optimizer(weight_decay, learning_rate, dual_learning_rate, (beta1, beta2), len(BANNED_TOKENS), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 
-# BANNED_TOKEN = 39 # a
-# BANNED_TOKEN = 40 # b
-BANNED_TOKEN = 58 # t?
-# BANNED_TOKEN = 6 # ,
-# BANNED_TOKEN = 53 # o
-
-# CONSTRAINTS
-constraint_fns = [
-    lambda logits: model.constraint(logits=logits, token=BANNED_TOKEN)
-    # lambda _: torch.tensor(0., requires_grad=True)
-]
 
 
 # compile the model
@@ -227,6 +228,29 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
+
+
+def constraint(logits, token):
+    """
+    Compute a regularization loss term that penalizes high probability of a specific token.
+
+    Args:
+        logits: The model's logits (before softmax), shape (batch_size, seq_len, vocab_size)
+        token: The token ID to penalize
+
+    Returns:
+        A scalar loss term to be added to the total loss
+    """
+    # Compute softmax probabilities        
+    probs = torch.nn.functional.softmax(logits, dim=-1)  # shape (batch_size, seq_len, vocab_size)
+    # Extract the probability of the unwanted token
+    token_probs = probs[..., token]  # shape (batch_size, seq_len)
+
+    # Penalize high probability: use mean to aggregate over batch and sequence
+    penalty = torch.mean(token_probs)
+    return penalty   
+
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -246,18 +270,19 @@ def estimate_loss():
 
 
 @torch.no_grad()
-def estimate_constraints(token):
+def estimate_constraints(constraints):
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        constraints = torch.zeros(eval_iters)
+        constraints_eval = torch.zeros((eval_iters, len(constraints)))
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, _ = get_batch(split)
             with ctx:
-                logits, _ = model(X, Y)
-                constraint = model.constraint(logits, token)
-            constraints[k] = constraint.item()
-        out[split] = constraints.mean()
+                c = []
+                logits, _ = model(X)
+                c_eval_iter = torch.tensor([constraint(logits).item() for constraint in constraints])
+            constraints_eval[k] = c_eval_iter
+        out[split] = constraints_eval.mean(axis=0).numpy()
     model.train()
     return out
 
@@ -297,8 +322,9 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        constraints = estimate_constraints(token=BANNED_TOKEN)
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train constr {constraints['val']:.4f}, val constr {constraints['val']:.4f}")
+        constraints = estimate_constraints([lambda logits: constraint(logits, token) for token in BANNED_TOKENS])
+        with np.printoptions(precision=5, suppress=True):
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train constr {constraints['train']}, val constr {constraints['val']}")
         print(f"optimizer dual vars: {optimizer._dual_vars}")
         if wandb_log:
             wandb.log({
@@ -341,8 +367,12 @@ while True:
     # eval constraints
     with ctx:
         constr_eval = []
-        for cf in constraint_fns:
-            constr_eval.append(cf(logits))
+        for token in BANNED_TOKENS:
+            # breakpoint()
+            constr_eval.append(constraint(logits, token))
+        # for i, cf in enumerate(constraint_fns):
+        #     breakpoint()
+        #     constr_eval.append(cf(logits))
 
     # torch.cuda.memory._record_memory_history(enabled='all')
     # constraint backward pass
@@ -362,7 +392,7 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         
     scaler.scale(loss).backward()
-    scaler.step(optimizer)#, c_val=[cv.detach() for cv in constr_eval])
+    scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
@@ -375,12 +405,12 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        constr_f = constr_eval[0].item()
-        constr_eval.clear()
+        constr_f = np.array([ce.item() for ce in constr_eval])
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, constr {constr_f:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        with np.printoptions(precision=5, suppress=True):
+            print(f"iter {iter_num}: loss {lossf:.4f}, constr {constr_f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         del constr_f
     iter_num += 1
     local_iter_num += 1

@@ -194,28 +194,6 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
-    
-
-    def constraint(self, logits, token):
-        """
-        Compute a regularization loss term that penalizes high probability of a specific token.
-
-        Args:
-            logits: The model's logits (before softmax), shape (batch_size, seq_len, vocab_size)
-            token: The token ID to penalize
-
-        Returns:
-            A scalar loss term to be added to the total loss
-        """
-        # Compute softmax probabilities        
-        probs = F.softmax(logits, dim=-1)  # shape (batch_size, seq_len, vocab_size)
-        
-        # Extract the probability of the unwanted token
-        token_probs = probs[..., token]  # shape (batch_size, seq_len)
-
-        # Penalize high probability: use mean to aggregate over batch and sequence
-        penalty = torch.mean(token_probs)
-        return penalty   
 
 
     def crop_block_size(self, block_size):
@@ -286,7 +264,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_constrained_optimizer(self, weight_decay, learning_rate, betas, device_type):
+    def configure_constrained_optimizer(self, weight_decay, learning_rate, dual_learning_rate, betas, m, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -312,10 +290,10 @@ class GPT(nn.Module):
         
         optimizer = SSLALM_Adam(
             params=optim_groups,
-            m = 1,
+            m = m,
             mu = 2.,
-            lr = 1e-3,
-            dual_lr = 5e-1,
+            lr = learning_rate,
+            dual_lr = dual_learning_rate,
             rho = 2.,
             dual_bound = 50,
             beta1 = betas[0],
