@@ -205,9 +205,7 @@ scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 # BANNED_TOKEN = 6 # ,
 # BANNED_TOKEN = 53 # o
 
-BANNED_TOKENS = [0, 39]
-
-# constraint_fns = [lambda logits: constraint(logits=logits, token=token) for token in BANNED_TOKENS]
+BANNED_TOKENS = [0]
 
 # optimizer
 dual_learning_rate = 5e-1
@@ -215,9 +213,6 @@ optimizer = model.configure_constrained_optimizer(weight_decay, learning_rate, d
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
-
-
-
 
 # compile the model
 if compile:
@@ -228,8 +223,7 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-
-
+    
 
 def constraint(logits, token):
     """
@@ -287,10 +281,10 @@ def estimate_constraints(constraints):
     return out
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
+def get_lr(it, init_learning_rate):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return init_learning_rate * (it + 1) / (warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
@@ -298,7 +292,7 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return min_lr + coeff * (init_learning_rate - min_lr)
 
 # logging
 if wandb_log and master_process:
@@ -315,7 +309,10 @@ running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = get_lr(iter_num, learning_rate) if decay_lr else learning_rate
+    dual_lr = get_lr(iter_num, dual_learning_rate) if decay_lr else dual_learning_rate
+
+    optimizer.dual_lr = dual_lr
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -349,12 +346,6 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
-    # if iter_num == 30:
-    #     s = torch.cuda.memory._snapshot()
-    #     with open(f"snapshot.pickle", "wb") as f:
-    #         pickle.dump(s, f)
-    #     torch.cuda.memory._record_memory_history(enabled=None)
-    #     break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -368,11 +359,7 @@ while True:
     with ctx:
         constr_eval = []
         for token in BANNED_TOKENS:
-            # breakpoint()
             constr_eval.append(constraint(logits, token))
-        # for i, cf in enumerate(constraint_fns):
-        #     breakpoint()
-        #     constr_eval.append(cf(logits))
 
     # torch.cuda.memory._record_memory_history(enabled='all')
     # constraint backward pass
@@ -387,7 +374,6 @@ while True:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        # breakpoint()
         optimizer.dual_step(j, cv)
         optimizer.zero_grad(set_to_none=True)
         
