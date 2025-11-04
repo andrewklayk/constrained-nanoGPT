@@ -26,8 +26,11 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.nn.functional as F
 
 from model import GPTConfig, GPT
+
+from constraint import pos_impl_constraint, softmax_constraint
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -205,11 +208,15 @@ scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 # BANNED_TOKEN = 6 # ,
 # BANNED_TOKEN = 53 # o
 
-BANNED_TOKENS = [0]
+BANNED_TOKENS = [-7, -19]
+
 
 # optimizer
-dual_learning_rate = 5e-1
-optimizer = model.configure_constrained_optimizer(weight_decay, learning_rate, dual_learning_rate, (beta1, beta2), len(BANNED_TOKENS), device_type)
+dual_learning_rate = 1.0
+optimizer = model.configure_constrained_optimizer(weight_decay, learning_rate, dual_learning_rate, (beta1, beta2), 
+                                                  len(BANNED_TOKENS),
+                                                # 1, 
+                                                device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -223,27 +230,7 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-    
 
-def constraint(logits, token):
-    """
-    Compute a regularization loss term that penalizes high probability of a specific token.
-
-    Args:
-        logits: The model's logits (before softmax), shape (batch_size, seq_len, vocab_size)
-        token: The token ID to penalize
-
-    Returns:
-        A scalar loss term to be added to the total loss
-    """
-    # Compute softmax probabilities        
-    probs = torch.nn.functional.softmax(logits, dim=-1)  # shape (batch_size, seq_len, vocab_size)
-    # Extract the probability of the unwanted token
-    token_probs = probs[..., token]  # shape (batch_size, seq_len)
-
-    # Penalize high probability: use mean to aggregate over batch and sequence
-    penalty = torch.mean(token_probs)
-    return penalty   
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -262,6 +249,27 @@ def estimate_loss():
     model.train()
     return out
 
+@torch.no_grad()
+def estimate_pos_constraints():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        constraints_eval = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, _ = get_batch(split)
+            with ctx:
+                c = []
+                con = 0
+                logits, _ = model(X)
+                probs = F.softmax(logits, dim=-1)
+                # breakpoint()
+                for pos in range(block_size-1):
+                    con += 1 - pos_impl_constraint(probs[:,pos,-7], 1-probs[:, pos+1, -19]) #t, h
+                c.append(con)
+            constraints_eval[k] = c
+        out[split] = constraints_eval.mean(axis=0).numpy()
+    model.train()
+    return out
 
 @torch.no_grad()
 def estimate_constraints(constraints):
@@ -319,7 +327,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        constraints = estimate_constraints([lambda logits: constraint(logits, token) for token in BANNED_TOKENS])
+        # constraints = estimate_pos_constraints()
+        constraints = estimate_constraints([lambda logits: softmax_constraint(logits, token, from_logits=True) for token in BANNED_TOKENS])
         with np.printoptions(precision=5, suppress=True):
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train constr {constraints['train']}, val constr {constraints['val']}")
         print(f"optimizer dual vars: {optimizer._dual_vars}")
@@ -351,31 +360,39 @@ while True:
     # and using the GradScaler if data type is float16
     with ctx:
         logits, loss = model(X, Y)
-
+    # breakpoint()
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = get_batch('train')
 
     # eval constraints
     with ctx:
         constr_eval = []
+        con = 0
+        probs = F.softmax(logits, dim=-1)
+        # breakpoint()
+        # for pos in range(block_size-1):
         for token in BANNED_TOKENS:
-            constr_eval.append(constraint(logits, token))
+            # con += 1 - torch.mean(pos_impl_constraint(probs[:,pos,-7], 1-probs[:, pos+1, -19]), dim=0)
+            constr_eval.append(softmax_constraint(probs, token))
+        
+        # constr_eval.append(con) #t, h
 
     # torch.cuda.memory._record_memory_history(enabled='all')
     # constraint backward pass
-    for j, cv in enumerate(constr_eval):
-        cv = scaler.scale(cv)
-        cv.backward(
-            retain_graph=True
-        )
-        
-        # clip the gradient
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if iter_num > 1:
+        for j, cv in enumerate(constr_eval):
+            cv = scaler.scale(cv)
+            cv.backward(
+                retain_graph=True
+            )
+            
+            # clip the gradient
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        optimizer.dual_step(j, cv)
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.dual_step(j, cv)
+            optimizer.zero_grad(set_to_none=True)
         
     scaler.scale(loss).backward()
     scaler.step(optimizer)
@@ -391,7 +408,8 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        constr_f = np.array([ce.item() for ce in constr_eval])
+        # breakpoint()
+        constr_f = np.array([ce.item() if isinstance(ce, torch.Tensor) else ce for ce in constr_eval])
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu

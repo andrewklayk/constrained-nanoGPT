@@ -286,19 +286,19 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         
-        from humancompatible.train.algorithms import SSLALM_Adam
+        from humancompatible.train.optim import SSLALM_Adam
         
         optimizer = SSLALM_Adam(
             params=optim_groups,
             m = m,
-            mu = 2.,
+            mu = 0.,
             lr = learning_rate,
             dual_lr = dual_learning_rate,
             rho = 2.,
             dual_bound = 50,
             beta1 = betas[0],
             beta2 = betas[1],
-            device=device_type
+            device=device_type,
             # **extra_args
         )
 
